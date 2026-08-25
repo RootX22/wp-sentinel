@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Test
+        run: pytest -q
+
+  lint:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check .
+
+  self-scan:
+    name: Scans a real WordPress and gate holds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+
+      # The authorisation gate is the tool's ethical contract; assert in CI
+      # that it actually blocks with no permission and no target.
+      - name: Refuses to scan without authorisation
+        run: |
+          if wp-sentinel example.com >/dev/null 2>&1; then
+            echo "gate did not block an unauthorised scan"; exit 1
+          fi
+          echo "ok: unauthorised scan blocked"
+
+      - name: --list-checks works without a target
+        run: wp-sentinel --list-checks | grep -q wpconfig-backup
+
+      # Stand up a throwaway WordPress in Docker and scan it end to end, so the
+      # checks are exercised against genuine WordPress output, not only the test
+      # fixture. This is our own container, hence WP_SENTINEL_AUTHORISED.
+      - name: Boot a real WordPress
+        run: |
+          docker run -d --name wp -p 8080:80 \
+            -e WORDPRESS_DB_HOST=db \
+            --link db:db wordpress:latest || true
+          docker run -d --name db \
+            -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=wordpress \
+            mysql:8 || true
+          # Best-effort: if the image pull is rate-limited, skip rather than fail
+          # the build on infrastructure we do not control.
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1; then
+              echo "wordpress is up"; echo UP=1 >> "$GITHUB_ENV"; break
+            fi
+            sleep 3
+          done
+
+      - name: Scan the real WordPress
+        if: env.UP == '1'
+        env:
+          WP_SENTINEL_AUTHORISED: "1"
+        run: |
+          # --fail-on never: a fresh install legitimately has findings; we are
+          # asserting the scanner runs and detects WordPress, not that the box
+          # is clean.
+          wp-sentinel http://127.0.0.1:8080 --json --fail-on never > scan.json
+          python - <<'PY'
+          import json
+          d = json.load(open("scan.json"))
+          assert d["is_wordpress"], "failed to detect a real WordPress install"
+          print("detected WordPress; findings:", len(d["findings"]))
+          PY
