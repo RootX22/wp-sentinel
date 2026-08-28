@@ -171,6 +171,10 @@ hardened one. A scanner that only tests the positive case ships false positives,
 which are worse than a missed finding — they teach the operator to ignore the
 output.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
+
 ## Licence
 
 MIT
